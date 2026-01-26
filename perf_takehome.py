@@ -41,6 +41,7 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.hash_map_const_map = None
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -49,7 +50,10 @@ class KernelBuilder:
         # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            if isinstance(slot, tuple):
+                instrs.append({engine: [slot]})
+            else:
+                instrs.append({engine: slot})
         return instrs
 
     def add(self, engine, slot):
@@ -61,6 +65,7 @@ class KernelBuilder:
             self.scratch[name] = addr
             self.scratch_debug[addr] = (name, length)
         self.scratch_ptr += length
+        print(f"{self.scratch_ptr / SCRATCH_SIZE * 100}% ({self.scratch_ptr}/{SCRATCH_SIZE})")
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
@@ -73,14 +78,107 @@ class KernelBuilder:
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
+        
+        # Pre-compute broadcasted versions of the scratch_const values.
+        if self.hash_map_const_map is None:
+            self.hash_map_const_map = {}
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                if val1 not in self.hash_map_const_map:
+                    self.hash_map_const_map[val1] = self.alloc_scratch("hash_map_const_map_val1", length=VLEN)
+                    self.add("valu", ("vbroadcast", self.hash_map_const_map[val1], self.scratch_const(val1)))
+
+                if val3 not in self.hash_map_const_map:
+                    self.hash_map_const_map[val3] = self.alloc_scratch("hash_map_const_map_val3", length=VLEN)
+                    self.add("valu", ("vbroadcast", self.hash_map_const_map[val3], self.scratch_const(val3)))
+
+            self.hash_map_const_map["stage0"] = self.alloc_scratch("stage0", length=VLEN)
+            self.add("load", ("const", self.hash_map_const_map["stage0"], 1 + (1 << 12)))
+            self.add("valu", ("vbroadcast", self.hash_map_const_map["stage0"], self.hash_map_const_map["stage0"]))
+
+            self.hash_map_const_map["stage2"] = self.alloc_scratch("stage2", length=VLEN)
+            self.add("load", ("const", self.hash_map_const_map["stage2"], 1 + (1 << 5)))
+            self.add("valu", ("vbroadcast", self.hash_map_const_map["stage2"], self.hash_map_const_map["stage2"]))
+
+            self.hash_map_const_map["stage4"] = self.alloc_scratch("stage4", length=VLEN)
+            self.add("load", ("const", self.hash_map_const_map["stage4"], 1 + (1 << 3)))
+            self.add("valu", ("vbroadcast", self.hash_map_const_map["stage4"], self.hash_map_const_map["stage4"]))
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+            const_val_1 = self.hash_map_const_map[val1]
+            const_val_3 = self.hash_map_const_map[val3]
+
+            if hi == 0 or hi == 2 or hi == 4:
+                # HASH_STAGES[0]:
+                # a = (a + 0x7ED55D16) + (a << 12) = 0x7ED55D16 + a + (a * 2^12) = 0x7ED55D16 + a * (1 + (1 << 12))
+
+                # HASH_STAGES[2]:
+                # a = (a + 0x165667B1) + (a << 5) = a + 0x165667B1 + a * 2^5 = 0x165667B1 + a * (1 + 2^5) = 0x165667B1 + a * (1 + (1 << 5))
+
+                # HASH_STAGES[4]:
+                # a = (a + 0xFD7046C5) + (a << 3) = 0xFD7046C5 + a * (1 + (1 << 3))
+                slots.append(("valu", ("multiply_add", val_hash_addr, val_hash_addr, self.hash_map_const_map[f"stage{hi}"], const_val_1)))
+            else:
+                # HASH_STAGES[1]:
+                # a = (a ^ 0xC761C23C) ^ (a >> 19) = ??
+
+                # HASH_STAGES[3]:
+                # a = (a + 0xD3A2646C) ^ (a << 9) = (a + 0xD3A2646C) ^ a * (1 << 9)
+
+                # HASH_STAGES[5]:
+                # a = (a ^ 0xB55A4F09) ^ (a >> 16) = ??
+                slots.append(("valu", (op1, tmp1, val_hash_addr, const_val_1)))
+                slots.append(("valu", (op3, tmp2, val_hash_addr, const_val_3)))
+                slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
+            
+            slots.append(("debug", ("vcompare", val_hash_addr, [(round, i * VLEN + j, "hash_stage", hi) for j in range(VLEN)])))
+
+
+        # for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+        #     slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
+        #     slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
+        #     slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
+        #     slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+
+        # # Please unroll the above
+        # # Unrolled hash stages
+        # # Stage 0: ("+", 0x7ED55D16, "+", "<<", 12)
+        # slots.append(("alu", ("+", tmp1, val_hash_addr, self.scratch_const(0x7ED55D16))))
+        # slots.append(("alu", ("<<", tmp2, val_hash_addr, self.scratch_const(12))))
+        # slots.append(("alu", ("+", val_hash_addr, tmp1, tmp2)))
+        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 0))))
+        
+        # # Stage 1: ("^", 0xC761C23C, "^", ">>", 19)
+        # slots.append(("alu", ("^", tmp1, val_hash_addr, self.scratch_const(0xC761C23C))))
+        # slots.append(("alu", (">>", tmp2, val_hash_addr, self.scratch_const(19))))
+        # slots.append(("alu", ("^", val_hash_addr, tmp1, tmp2)))
+        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 1))))
+        
+        # # Stage 2: ("+", 0x165667B1, "+", "<<", 5)
+        # slots.append(("alu", ("+", tmp1, val_hash_addr, self.scratch_const(0x165667B1))))
+        # slots.append(("alu", ("<<", tmp2, val_hash_addr, self.scratch_const(5))))
+        # slots.append(("alu", ("+", val_hash_addr, tmp1, tmp2)))
+        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 2))))
+        
+        # # Stage 3: ("+", 0xD3A2646C, "^", "<<", 9)
+        # slots.append(("alu", ("+", tmp1, val_hash_addr, self.scratch_const(0xD3A2646C))))
+        # slots.append(("alu", ("<<", tmp2, val_hash_addr, self.scratch_const(9))))
+        # slots.append(("alu", ("^", val_hash_addr, tmp1, tmp2)))
+        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 3))))
+
+        # # Stage 4: ("+", 0xFD7046C5, "+", "<<", 3)
+        # slots.append(("alu", ("+", tmp1, val_hash_addr, self.scratch_const(0xFD7046C5))))
+        # slots.append(("alu", ("<<", tmp2, val_hash_addr, self.scratch_const(3))))
+        # slots.append(("alu", ("+", val_hash_addr, tmp1, tmp2)))
+        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 4))))
+        
+        # # Stage 5: ("^", 0xB55A4F09, "^", ">>", 16)
+        # slots.append(("alu", ("^", tmp1, val_hash_addr, self.scratch_const(0xB55A4F09))))
+        # slots.append(("alu", (">>", tmp2, val_hash_addr, self.scratch_const(16))))
+        # slots.append(("alu", ("^", val_hash_addr, tmp1, tmp2)))
+        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 5))))
 
         return slots
+
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -89,9 +187,9 @@ class KernelBuilder:
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
+        tmp1 = self.alloc_scratch("tmp1", VLEN)
+        tmp2 = self.alloc_scratch("tmp2", VLEN)
+
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -103,10 +201,11 @@ class KernelBuilder:
             "inp_values_p",
         ]
         for v in init_vars:
-            self.alloc_scratch(v, 1)
+            self.alloc_scratch(v, VLEN)
         for i, v in enumerate(init_vars):
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
+            self.add("valu", ("vbroadcast", self.scratch[v], self.scratch[v]))
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
@@ -123,47 +222,130 @@ class KernelBuilder:
         body = []  # array of slots
 
         # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        tmp_idx = self.alloc_scratch("tmp_idx", VLEN)
+        tmp_val = self.alloc_scratch("tmp_val", VLEN)
+        tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN)
+        tmp_addr = self.alloc_scratch("tmp_addr", VLEN)
+
+        tmp_zero_const = self.alloc_scratch("zero_consts", VLEN)
+        tmp_one_const = self.alloc_scratch("one_consts", VLEN)
+        tmp_two_const = self.alloc_scratch("two_consts", VLEN)
+
+        # Broadcast const values so they can be used in SIMD instructions.
+        self.add("valu", ("vbroadcast", tmp_zero_const, zero_const))
+        self.add("valu", ("vbroadcast", tmp_one_const, one_const))
+        self.add("valu", ("vbroadcast", tmp_two_const, two_const))
+
+        zero_const = tmp_zero_const
+        one_const = tmp_one_const
+        two_const = tmp_two_const
+
+        index_consts = [self.scratch_const(i * VLEN) for i in range(int(batch_size / VLEN))]
+
+        # Calculates "inp_indices_p + i" of "mem[inp_indices_p + i]" once and can be reused across rounds.
+        inp_indices = [self.alloc_scratch() for i in range(int(batch_size / VLEN))]
+        for i in range(int(batch_size / VLEN)):
+            self.add("alu", ("+", inp_indices[i], self.scratch["inp_indices_p"], index_consts[i]))
+
+        inp_values = [self.alloc_scratch() for i in range(int(batch_size / VLEN))]
+        for i in range(int(batch_size / VLEN)):
+            self.add("alu", ("+", inp_values[i], self.scratch["inp_values_p"], index_consts[i]))
 
         for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
+            for i in range(int(batch_size / VLEN)):
+                # ======== "idx = mem[inp_indices_p + i]" =======
+
                 # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
+                body.append(("load", ("vload", tmp_idx, inp_indices[i])))
+                body.append(("debug", ("vcompare", tmp_idx, [(round, i * VLEN + j, "idx") for j in range(VLEN)])))
+
+                # ======== "val = mem[inp_values_p + i]"
+
                 # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+                body.append(("load", ("vload", tmp_val, inp_values[i])))
+                body.append(("debug", ("vcompare", tmp_val, [(round, i * VLEN + j, "val") for j in range(VLEN)])))
+
+                # ======== "node_val = mem[forest_values_p + idx]" ========
+
+                # forest_values_p + idx
+                body.append(("valu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
+
+                for j in range(int(VLEN / 2)):
+                    # Two loads can happen concurrently.
+                    body.append(("load", [
+                        ("load", tmp_node_val + j * 2, tmp_addr + j * 2),
+                        ("load", tmp_node_val + j * 2 + 1, tmp_addr + j * 2 + 1),
+                    ]))
+
+                body.append(("debug", ("vcompare", tmp_node_val, [(round, i * VLEN + j, "node_val") for j in range(VLEN)])))
+
+                # ======== "val = myhash(val ^ node_val)" ===========
+
+                # val ^ node_val
+                body.append(("valu", ("^", tmp_val, tmp_val, tmp_node_val)))
+
                 # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
                 body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
+
+                # ======== "idx = 2*idx + (1 if val % 2 == 0 else 2)" ========
+
+                # (1 if val % 2 == 0 else 2) --> (val & 0x1) + 1
+                body.append(("valu", ("&", tmp1, tmp_val, one_const)))
+                body.append(("valu", ("+", tmp1, tmp1, one_const)))
+
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+                body.append(("valu", ("multiply_add", tmp_idx, two_const, tmp_idx, tmp1)))
+
+                # ======== "idx = 0 if idx >= n_nodes else idx" ========
+
+                # idx >= n_nodes
+                body.append(("valu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
+
+                # "idx = 0 if idx >= n_nodes else idx"
+                body.append(("flow", ("vselect", tmp_idx, tmp1, tmp_idx, zero_const)))
+
+                # ======== "mem[inp_indices_p + i] = idx" ========
+                body.append(("store", ("vstore", inp_indices[i], tmp_idx)))
+
+                # ======== "mem[inp_values_p + i] = val" ========
+                body.append(("store", ("vstore", inp_values[i], tmp_val)))
+
+        # for round in range(rounds):
+        #     for i in range(batch_size):
+        #         i_const = self.scratch_const(i)
+        #         # idx = mem[inp_indices_p + i]
+        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+        #         body.append(("load", ("load", tmp_idx, tmp_addr)))
+        #         body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
+        #         # val = mem[inp_values_p + i]
+        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+        #         body.append(("load", ("load", tmp_val, tmp_addr)))
+        #         body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
+        #         # node_val = mem[forest_values_p + idx]
+        #         body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
+        #         body.append(("load", ("load", tmp_node_val, tmp_addr)))
+        #         body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+        #         # val = myhash(val ^ node_val)
+        #         body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
+        #         body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
+        #         body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
+        #         # idx = 2*idx + (1 if val % 2 == 0 else 2)
+        #         body.append(("alu", ("%", tmp1, tmp_val, two_const)))
+        #         body.append(("alu", ("==", tmp1, tmp1, zero_const)))
+        #         body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+        #         body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
+        #         body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
+        #         body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
+        #         # idx = 0 if idx >= n_nodes else idx
+        #         body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
+        #         body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
+        #         body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
+        #         # mem[inp_indices_p + i] = idx
+        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+        #         body.append(("store", ("store", tmp_addr, tmp_idx)))
+        #         # mem[inp_values_p + i] = val
+        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+        #         body.append(("store", ("store", tmp_addr, tmp_val)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
