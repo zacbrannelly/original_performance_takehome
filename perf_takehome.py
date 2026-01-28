@@ -33,6 +33,10 @@ from problem import (
     reference_kernel2,
 )
 
+# How many VALU operations need to be running at once.
+# load, store can only have 2 so they need to be duplicated.
+# flow can only have 1, so this needs to be repeated 4 times.
+PACK_SIZE = 4
 
 class KernelBuilder:
     def __init__(self):
@@ -116,7 +120,7 @@ class KernelBuilder:
 
                 # HASH_STAGES[4]:
                 # a = (a + 0xFD7046C5) + (a << 3) = 0xFD7046C5 + a * (1 + (1 << 3))
-                slots.append(("valu", ("multiply_add", val_hash_addr, val_hash_addr, self.hash_map_const_map[f"stage{hi}"], const_val_1)))
+                slots.append(("valu", [("multiply_add", val_hash_addr + j * VLEN, val_hash_addr + j * VLEN, self.hash_map_const_map[f"stage{hi}"], const_val_1) for j in range(PACK_SIZE)]))
             else:
                 # HASH_STAGES[1]:
                 # a = (a ^ 0xC761C23C) ^ (a >> 19) = ??
@@ -126,11 +130,12 @@ class KernelBuilder:
 
                 # HASH_STAGES[5]:
                 # a = (a ^ 0xB55A4F09) ^ (a >> 16) = ??
-                slots.append(("valu", (op1, tmp1, val_hash_addr, const_val_1)))
-                slots.append(("valu", (op3, tmp2, val_hash_addr, const_val_3)))
-                slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
+                slots.append(("valu", [(op1, tmp1 + j * VLEN, val_hash_addr + j * VLEN, const_val_1) for j in range(PACK_SIZE)]))
+                slots.append(("valu", [(op3, tmp2 + j * VLEN, val_hash_addr + j * VLEN, const_val_3) for j in range(PACK_SIZE)]))
+                slots.append(("valu", [(op2, val_hash_addr + j * VLEN, tmp1 + j * VLEN, tmp2 + j * VLEN) for j in range(PACK_SIZE)]))
             
-            slots.append(("debug", ("vcompare", val_hash_addr, [(round, i * VLEN + j, "hash_stage", hi) for j in range(VLEN)])))
+            for k in range(PACK_SIZE):
+                slots.append(("debug", ("vcompare", val_hash_addr + k * VLEN, [(round, i * VLEN * PACK_SIZE + k * VLEN + j, "hash_stage", hi) for j in range(VLEN)])))
 
 
         # for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
@@ -187,8 +192,8 @@ class KernelBuilder:
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
         """
-        tmp1 = self.alloc_scratch("tmp1", VLEN)
-        tmp2 = self.alloc_scratch("tmp2", VLEN)
+        tmp1 = self.alloc_scratch("tmp1", VLEN * PACK_SIZE)
+        tmp2 = self.alloc_scratch("tmp2", VLEN * PACK_SIZE)
 
         # Scratch space addresses
         init_vars = [
@@ -222,10 +227,10 @@ class KernelBuilder:
         body = []  # array of slots
 
         # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx", VLEN)
-        tmp_val = self.alloc_scratch("tmp_val", VLEN)
-        tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN)
-        tmp_addr = self.alloc_scratch("tmp_addr", VLEN)
+        tmp_idx = self.alloc_scratch("tmp_idx", VLEN * PACK_SIZE)
+        tmp_val = self.alloc_scratch("tmp_val", VLEN * PACK_SIZE)
+        tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN * PACK_SIZE)
+        tmp_addr = self.alloc_scratch("tmp_addr", VLEN * PACK_SIZE)
 
         tmp_zero_const = self.alloc_scratch("zero_consts", VLEN)
         tmp_one_const = self.alloc_scratch("one_consts", VLEN)
@@ -252,100 +257,118 @@ class KernelBuilder:
             self.add("alu", ("+", inp_values[i], self.scratch["inp_values_p"], index_consts[i]))
 
         for round in range(rounds):
-            for i in range(int(batch_size / VLEN)):
+            for i in range(int(batch_size / VLEN / PACK_SIZE)):
                 # ======== "idx = mem[inp_indices_p + i]" =======
 
                 # idx = mem[inp_indices_p + i]
-                body.append(("load", ("vload", tmp_idx, inp_indices[i])))
-                body.append(("debug", ("vcompare", tmp_idx, [(round, i * VLEN + j, "idx") for j in range(VLEN)])))
+                # body.append(("load", ("vload", tmp_idx, inp_indices[i])))
+                # body.append(("debug", ("vcompare", tmp_idx, [(round, i * VLEN + j, "idx") for j in range(VLEN)])))
 
-                # ======== "val = mem[inp_values_p + i]"
+                for j in range(int(PACK_SIZE / 2)):
+                    slots = [
+                        ("vload", tmp_idx + j * 2 * VLEN + k * VLEN, inp_indices[i * PACK_SIZE + j * 2 + k])
+                        for k in range(2)
+                    ]
+                    body.append(("load", slots))
 
-                # val = mem[inp_values_p + i]
-                body.append(("load", ("vload", tmp_val, inp_values[i])))
-                body.append(("debug", ("vcompare", tmp_val, [(round, i * VLEN + j, "val") for j in range(VLEN)])))
+                for j in range(PACK_SIZE):
+                    body.append(("debug", ("vcompare", tmp_idx + j * VLEN, [(round, i * VLEN * PACK_SIZE + j * VLEN + k, "idx") for k in range(VLEN)])))
 
-                # ======== "node_val = mem[forest_values_p + idx]" ========
+                # # ======== "val = mem[inp_values_p + i]"
 
-                # forest_values_p + idx
-                body.append(("valu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
+                # # val = mem[inp_values_p + i]
+                # body.append(("load", ("vload", tmp_val, inp_values[i])))
+                # body.append(("debug", ("vcompare", tmp_val, [(round, i * VLEN + j, "val") for j in range(VLEN)])))
 
-                for j in range(int(VLEN / 2)):
-                    # Two loads can happen concurrently.
-                    body.append(("load", [
-                        ("load", tmp_node_val + j * 2, tmp_addr + j * 2),
-                        ("load", tmp_node_val + j * 2 + 1, tmp_addr + j * 2 + 1),
-                    ]))
+                for j in range(int(PACK_SIZE / 2)):
+                    slots = [
+                        ("vload", tmp_val + j * 2 * VLEN + k * VLEN, inp_values[i * PACK_SIZE + j * 2 + k])
+                        for k in range(2)
+                    ]
+                    body.append(("load", slots))
 
-                body.append(("debug", ("vcompare", tmp_node_val, [(round, i * VLEN + j, "node_val") for j in range(VLEN)])))
+                for j in range(PACK_SIZE):
+                    body.append(("debug", ("vcompare", tmp_val + j * VLEN, [(round, i * VLEN * PACK_SIZE + j * VLEN + k, "val") for k in range(VLEN)])))
 
-                # ======== "val = myhash(val ^ node_val)" ===========
 
-                # val ^ node_val
-                body.append(("valu", ("^", tmp_val, tmp_val, tmp_node_val)))
+                # # ======== "node_val = mem[forest_values_p + idx]" ========
 
-                # val = myhash(val ^ node_val)
+                # # forest_values_p + idx
+                # body.append(("valu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
+
+                body.append(("valu", [
+                    ("+", tmp_addr + j * VLEN, self.scratch["forest_values_p"], tmp_idx + j * VLEN)
+                    for j in range(PACK_SIZE)
+                ]))
+
+                # for j in range(int(VLEN / 2)):
+                #     # Two loads can happen concurrently.
+                #     body.append(("load", [
+                #         ("load", tmp_node_val + j * 2, tmp_addr + j * 2),
+                #         ("load", tmp_node_val + j * 2 + 1, tmp_addr + j * 2 + 1),
+                #     ]))
+
+                for k in range(PACK_SIZE):
+                    for j in range(int(VLEN / 2)):
+                        # Two loads can happen concurrently.
+                        body.append(("load", [
+                            ("load", tmp_node_val + k * VLEN + j * 2, tmp_addr + k * VLEN + j * 2),
+                            ("load", tmp_node_val + k * VLEN + j * 2 + 1, tmp_addr + k * VLEN + j * 2 + 1),
+                        ]))   
+
+                # body.append(("debug", ("vcompare", tmp_node_val, [(round, i * VLEN + j, "node_val") for j in range(VLEN)])))
+                
+                for k in range(PACK_SIZE):
+                    body.append(("debug", ("vcompare", tmp_node_val + k * VLEN, [(round, i * VLEN * PACK_SIZE + k * VLEN + j, "node_val") for j in range(VLEN)])))
+
+                # # ======== "val = myhash(val ^ node_val)" ===========
+
+                # # val ^ node_val
+                # body.append(("valu", ("^", tmp_val, tmp_val, tmp_node_val)))
+
+                body.append(("valu", [("^", tmp_val + j * VLEN, tmp_val + j * VLEN, tmp_node_val + j * VLEN) for j in range(PACK_SIZE)]))
+                
+                # # val = myhash(val ^ node_val)
                 body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
 
-                # ======== "idx = 2*idx + (1 if val % 2 == 0 else 2)" ========
+                # # ======== "idx = 2*idx + (1 if val % 2 == 0 else 2)" ========
 
-                # (1 if val % 2 == 0 else 2) --> (val & 0x1) + 1
-                body.append(("valu", ("&", tmp1, tmp_val, one_const)))
-                body.append(("valu", ("+", tmp1, tmp1, one_const)))
+                # # (1 if val % 2 == 0 else 2) --> (val & 0x1) + 1
+                # body.append(("valu", ("&", tmp1, tmp_val, one_const)))
+                # body.append(("valu", ("+", tmp1, tmp1, one_const)))
 
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("valu", ("multiply_add", tmp_idx, two_const, tmp_idx, tmp1)))
+                body.append(("valu", [("&", tmp1 + j * VLEN, tmp_val + j * VLEN, one_const) for j in range(PACK_SIZE)]))
+                body.append(("valu", [("+", tmp1 + j * VLEN, tmp1 + j * VLEN, one_const) for j in range(PACK_SIZE)]))
 
-                # ======== "idx = 0 if idx >= n_nodes else idx" ========
+                # # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                # body.append(("valu", ("multiply_add", tmp_idx, two_const, tmp_idx, tmp1)))
 
-                # idx >= n_nodes
-                body.append(("valu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
+                body.append(("valu", [("multiply_add", tmp_idx + j * VLEN, two_const, tmp_idx + j * VLEN, tmp1 + j * VLEN) for j in range(PACK_SIZE)]))
 
-                # "idx = 0 if idx >= n_nodes else idx"
-                body.append(("flow", ("vselect", tmp_idx, tmp1, tmp_idx, zero_const)))
+                # # ======== "idx = 0 if idx >= n_nodes else idx" ========
 
-                # ======== "mem[inp_indices_p + i] = idx" ========
-                body.append(("store", ("vstore", inp_indices[i], tmp_idx)))
+                # # idx >= n_nodes
+                # body.append(("valu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
 
-                # ======== "mem[inp_values_p + i] = val" ========
-                body.append(("store", ("vstore", inp_values[i], tmp_val)))
+                body.append(("valu", [("<", tmp1 + j * VLEN, tmp_idx + j * VLEN, self.scratch["n_nodes"]) for j in range(PACK_SIZE)]))
 
-        # for round in range(rounds):
-        #     for i in range(batch_size):
-        #         i_const = self.scratch_const(i)
-        #         # idx = mem[inp_indices_p + i]
-        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-        #         body.append(("load", ("load", tmp_idx, tmp_addr)))
-        #         body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-        #         # val = mem[inp_values_p + i]
-        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-        #         body.append(("load", ("load", tmp_val, tmp_addr)))
-        #         body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-        #         # node_val = mem[forest_values_p + idx]
-        #         body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-        #         body.append(("load", ("load", tmp_node_val, tmp_addr)))
-        #         body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-        #         # val = myhash(val ^ node_val)
-        #         body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-        #         body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-        #         body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-        #         # idx = 2*idx + (1 if val % 2 == 0 else 2)
-        #         body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-        #         body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-        #         body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-        #         body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-        #         body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-        #         body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-        #         # idx = 0 if idx >= n_nodes else idx
-        #         body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-        #         body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-        #         body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-        #         # mem[inp_indices_p + i] = idx
-        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-        #         body.append(("store", ("store", tmp_addr, tmp_idx)))
-        #         # mem[inp_values_p + i] = val
-        #         body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-        #         body.append(("store", ("store", tmp_addr, tmp_val)))
+                # # "idx = 0 if idx >= n_nodes else idx"
+                # body.append(("flow", ("vselect", tmp_idx, tmp1, tmp_idx, zero_const)))
+
+                for j in range(PACK_SIZE):
+                    body.append(("flow", ("vselect", tmp_idx + j * VLEN, tmp1 + j * VLEN, tmp_idx + j * VLEN, zero_const)))
+
+                # # ======== "mem[inp_indices_p + i] = idx" ========
+                # body.append(("store", ("vstore", inp_indices[i], tmp_idx)))
+
+                for j in range(int(PACK_SIZE / 2)):
+                    body.append(("store", [("vstore", inp_indices[i * PACK_SIZE + j * 2 + k], tmp_idx + j * 2 * VLEN + k * VLEN) for k in range(2)]))
+
+                # # ======== "mem[inp_values_p + i] = val" ========
+                # body.append(("store", ("vstore", inp_values[i], tmp_val)))
+
+                for j in range(int(PACK_SIZE / 2)):
+                    body.append(("store", [("vstore", inp_values[i * PACK_SIZE + j * 2 + k], tmp_val + j * 2 * VLEN + k * VLEN) for k in range(2)]))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
