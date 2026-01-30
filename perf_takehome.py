@@ -91,7 +91,8 @@ class KernelBuilder:
                     self.hash_map_const_map[val1] = self.alloc_scratch("hash_map_const_map_val1", length=VLEN)
                     self.add("valu", ("vbroadcast", self.hash_map_const_map[val1], self.scratch_const(val1)))
 
-                if val3 not in self.hash_map_const_map:
+                # val3 not needed for even hash stages (they use the multiply add trick instead).
+                if val3 not in self.hash_map_const_map and hi % 2 != 0:
                     self.hash_map_const_map[val3] = self.alloc_scratch("hash_map_const_map_val3", length=VLEN)
                     self.add("valu", ("vbroadcast", self.hash_map_const_map[val3], self.scratch_const(val3)))
 
@@ -109,7 +110,6 @@ class KernelBuilder:
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             const_val_1 = self.hash_map_const_map[val1]
-            const_val_3 = self.hash_map_const_map[val3]
 
             if hi == 0 or hi == 2 or hi == 4:
                 # HASH_STAGES[0]:
@@ -122,6 +122,8 @@ class KernelBuilder:
                 # a = (a + 0xFD7046C5) + (a << 3) = 0xFD7046C5 + a * (1 + (1 << 3))
                 slots.append(("valu", [("multiply_add", val_hash_addr + j * VLEN, val_hash_addr + j * VLEN, self.hash_map_const_map[f"stage{hi}"], const_val_1) for j in range(PACK_SIZE)]))
             else:
+                const_val_3 = self.hash_map_const_map[val3]
+
                 # HASH_STAGES[1]:
                 # a = (a ^ 0xC761C23C) ^ (a >> 19) = ??
 
@@ -136,51 +138,6 @@ class KernelBuilder:
             
             for k in range(PACK_SIZE):
                 slots.append(("debug", ("vcompare", val_hash_addr + k * VLEN, [(round, i * VLEN * PACK_SIZE + k * VLEN + j, "hash_stage", hi) for j in range(VLEN)])))
-
-
-        # for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-        #     slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-        #     slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-        #     slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-        #     slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        # # Please unroll the above
-        # # Unrolled hash stages
-        # # Stage 0: ("+", 0x7ED55D16, "+", "<<", 12)
-        # slots.append(("alu", ("+", tmp1, val_hash_addr, self.scratch_const(0x7ED55D16))))
-        # slots.append(("alu", ("<<", tmp2, val_hash_addr, self.scratch_const(12))))
-        # slots.append(("alu", ("+", val_hash_addr, tmp1, tmp2)))
-        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 0))))
-        
-        # # Stage 1: ("^", 0xC761C23C, "^", ">>", 19)
-        # slots.append(("alu", ("^", tmp1, val_hash_addr, self.scratch_const(0xC761C23C))))
-        # slots.append(("alu", (">>", tmp2, val_hash_addr, self.scratch_const(19))))
-        # slots.append(("alu", ("^", val_hash_addr, tmp1, tmp2)))
-        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 1))))
-        
-        # # Stage 2: ("+", 0x165667B1, "+", "<<", 5)
-        # slots.append(("alu", ("+", tmp1, val_hash_addr, self.scratch_const(0x165667B1))))
-        # slots.append(("alu", ("<<", tmp2, val_hash_addr, self.scratch_const(5))))
-        # slots.append(("alu", ("+", val_hash_addr, tmp1, tmp2)))
-        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 2))))
-        
-        # # Stage 3: ("+", 0xD3A2646C, "^", "<<", 9)
-        # slots.append(("alu", ("+", tmp1, val_hash_addr, self.scratch_const(0xD3A2646C))))
-        # slots.append(("alu", ("<<", tmp2, val_hash_addr, self.scratch_const(9))))
-        # slots.append(("alu", ("^", val_hash_addr, tmp1, tmp2)))
-        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 3))))
-
-        # # Stage 4: ("+", 0xFD7046C5, "+", "<<", 3)
-        # slots.append(("alu", ("+", tmp1, val_hash_addr, self.scratch_const(0xFD7046C5))))
-        # slots.append(("alu", ("<<", tmp2, val_hash_addr, self.scratch_const(3))))
-        # slots.append(("alu", ("+", val_hash_addr, tmp1, tmp2)))
-        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 4))))
-        
-        # # Stage 5: ("^", 0xB55A4F09, "^", ">>", 16)
-        # slots.append(("alu", ("^", tmp1, val_hash_addr, self.scratch_const(0xB55A4F09))))
-        # slots.append(("alu", (">>", tmp2, val_hash_addr, self.scratch_const(16))))
-        # slots.append(("alu", ("^", val_hash_addr, tmp1, tmp2)))
-        # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", 5))))
 
         return slots
 
@@ -261,9 +218,6 @@ class KernelBuilder:
                 # ======== "idx = mem[inp_indices_p + i]" =======
 
                 # idx = mem[inp_indices_p + i]
-                # body.append(("load", ("vload", tmp_idx, inp_indices[i])))
-                # body.append(("debug", ("vcompare", tmp_idx, [(round, i * VLEN + j, "idx") for j in range(VLEN)])))
-
                 for j in range(int(PACK_SIZE / 2)):
                     slots = [
                         ("vload", tmp_idx + j * 2 * VLEN + k * VLEN, inp_indices[i * PACK_SIZE + j * 2 + k])
@@ -277,9 +231,6 @@ class KernelBuilder:
                 # # ======== "val = mem[inp_values_p + i]"
 
                 # # val = mem[inp_values_p + i]
-                # body.append(("load", ("vload", tmp_val, inp_values[i])))
-                # body.append(("debug", ("vcompare", tmp_val, [(round, i * VLEN + j, "val") for j in range(VLEN)])))
-
                 for j in range(int(PACK_SIZE / 2)):
                     slots = [
                         ("vload", tmp_val + j * 2 * VLEN + k * VLEN, inp_values[i * PACK_SIZE + j * 2 + k])
@@ -290,23 +241,13 @@ class KernelBuilder:
                 for j in range(PACK_SIZE):
                     body.append(("debug", ("vcompare", tmp_val + j * VLEN, [(round, i * VLEN * PACK_SIZE + j * VLEN + k, "val") for k in range(VLEN)])))
 
-
                 # # ======== "node_val = mem[forest_values_p + idx]" ========
 
                 # # forest_values_p + idx
-                # body.append(("valu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-
                 body.append(("valu", [
                     ("+", tmp_addr + j * VLEN, self.scratch["forest_values_p"], tmp_idx + j * VLEN)
                     for j in range(PACK_SIZE)
                 ]))
-
-                # for j in range(int(VLEN / 2)):
-                #     # Two loads can happen concurrently.
-                #     body.append(("load", [
-                #         ("load", tmp_node_val + j * 2, tmp_addr + j * 2),
-                #         ("load", tmp_node_val + j * 2 + 1, tmp_addr + j * 2 + 1),
-                #     ]))
 
                 for k in range(PACK_SIZE):
                     for j in range(int(VLEN / 2)):
@@ -316,16 +257,12 @@ class KernelBuilder:
                             ("load", tmp_node_val + k * VLEN + j * 2 + 1, tmp_addr + k * VLEN + j * 2 + 1),
                         ]))   
 
-                # body.append(("debug", ("vcompare", tmp_node_val, [(round, i * VLEN + j, "node_val") for j in range(VLEN)])))
-                
                 for k in range(PACK_SIZE):
                     body.append(("debug", ("vcompare", tmp_node_val + k * VLEN, [(round, i * VLEN * PACK_SIZE + k * VLEN + j, "node_val") for j in range(VLEN)])))
 
                 # # ======== "val = myhash(val ^ node_val)" ===========
 
                 # # val ^ node_val
-                # body.append(("valu", ("^", tmp_val, tmp_val, tmp_node_val)))
-
                 body.append(("valu", [("^", tmp_val + j * VLEN, tmp_val + j * VLEN, tmp_node_val + j * VLEN) for j in range(PACK_SIZE)]))
                 
                 # # val = myhash(val ^ node_val)
@@ -334,39 +271,26 @@ class KernelBuilder:
                 # # ======== "idx = 2*idx + (1 if val % 2 == 0 else 2)" ========
 
                 # # (1 if val % 2 == 0 else 2) --> (val & 0x1) + 1
-                # body.append(("valu", ("&", tmp1, tmp_val, one_const)))
-                # body.append(("valu", ("+", tmp1, tmp1, one_const)))
-
                 body.append(("valu", [("&", tmp1 + j * VLEN, tmp_val + j * VLEN, one_const) for j in range(PACK_SIZE)]))
                 body.append(("valu", [("+", tmp1 + j * VLEN, tmp1 + j * VLEN, one_const) for j in range(PACK_SIZE)]))
 
                 # # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                # body.append(("valu", ("multiply_add", tmp_idx, two_const, tmp_idx, tmp1)))
-
                 body.append(("valu", [("multiply_add", tmp_idx + j * VLEN, two_const, tmp_idx + j * VLEN, tmp1 + j * VLEN) for j in range(PACK_SIZE)]))
 
                 # # ======== "idx = 0 if idx >= n_nodes else idx" ========
 
                 # # idx >= n_nodes
-                # body.append(("valu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-
                 body.append(("valu", [("<", tmp1 + j * VLEN, tmp_idx + j * VLEN, self.scratch["n_nodes"]) for j in range(PACK_SIZE)]))
 
                 # # "idx = 0 if idx >= n_nodes else idx"
-                # body.append(("flow", ("vselect", tmp_idx, tmp1, tmp_idx, zero_const)))
-
                 for j in range(PACK_SIZE):
                     body.append(("flow", ("vselect", tmp_idx + j * VLEN, tmp1 + j * VLEN, tmp_idx + j * VLEN, zero_const)))
 
                 # # ======== "mem[inp_indices_p + i] = idx" ========
-                # body.append(("store", ("vstore", inp_indices[i], tmp_idx)))
-
                 for j in range(int(PACK_SIZE / 2)):
                     body.append(("store", [("vstore", inp_indices[i * PACK_SIZE + j * 2 + k], tmp_idx + j * 2 * VLEN + k * VLEN) for k in range(2)]))
 
                 # # ======== "mem[inp_values_p + i] = val" ========
-                # body.append(("store", ("vstore", inp_values[i], tmp_val)))
-
                 for j in range(int(PACK_SIZE / 2)):
                     body.append(("store", [("vstore", inp_values[i * PACK_SIZE + j * 2 + k], tmp_val + j * 2 * VLEN + k * VLEN) for k in range(2)]))
 
