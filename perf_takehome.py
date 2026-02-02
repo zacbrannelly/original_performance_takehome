@@ -14,6 +14,7 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+from typing import Union, Dict, List
 import random
 import unittest
 
@@ -33,6 +34,8 @@ from problem import (
     reference_kernel2,
 )
 
+from compiler import JITContext, compile_jit_code
+
 # How many VALU operations need to be running at once.
 # load, store can only have 2 so they need to be duplicated.
 # flow can only have 1, so this needs to be repeated 4 times.
@@ -50,14 +53,25 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+    def build(self, slots: list[Union[tuple[Engine, tuple], Dict[Engine, List[tuple]]]], vliw: bool = False):
         # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
-        for engine, slot in slots:
-            if isinstance(slot, tuple):
-                instrs.append({engine: [slot]})
+
+        # Allow multiple engine slots being provided for a single instruction (VLIW).
+        if isinstance(slots[0], dict):
+            instrs.extend(slots)
+            return instrs
+
+        for engine_and_slot in slots:
+            if isinstance(engine_and_slot, dict):
+                instrs.append(engine_and_slot)
             else:
-                instrs.append({engine: slot})
+                engine, slot = engine_and_slot
+                if isinstance(slot, tuple):
+                    instrs.append({engine: [slot]})
+                else:
+                    instrs.append({engine: slot})
+
         return instrs
 
     def add(self, engine, slot):
@@ -82,31 +96,6 @@ class KernelBuilder:
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i, pack_stride, pack_size):
         slots = []
-        
-        # Pre-compute broadcasted versions of the scratch_const values.
-        if self.hash_map_const_map is None:
-            self.hash_map_const_map = {}
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                if val1 not in self.hash_map_const_map:
-                    self.hash_map_const_map[val1] = self.alloc_scratch("hash_map_const_map_val1", length=VLEN)
-                    self.add("valu", ("vbroadcast", self.hash_map_const_map[val1], self.scratch_const(val1)))
-
-                # val3 not needed for even hash stages (they use the multiply add trick instead).
-                if val3 not in self.hash_map_const_map and hi % 2 != 0:
-                    self.hash_map_const_map[val3] = self.alloc_scratch("hash_map_const_map_val3", length=VLEN)
-                    self.add("valu", ("vbroadcast", self.hash_map_const_map[val3], self.scratch_const(val3)))
-
-            self.hash_map_const_map["stage0"] = self.alloc_scratch("stage0", length=VLEN)
-            self.add("load", ("const", self.hash_map_const_map["stage0"], 1 + (1 << 12)))
-            self.add("valu", ("vbroadcast", self.hash_map_const_map["stage0"], self.hash_map_const_map["stage0"]))
-
-            self.hash_map_const_map["stage2"] = self.alloc_scratch("stage2", length=VLEN)
-            self.add("load", ("const", self.hash_map_const_map["stage2"], 1 + (1 << 5)))
-            self.add("valu", ("vbroadcast", self.hash_map_const_map["stage2"], self.hash_map_const_map["stage2"]))
-
-            self.hash_map_const_map["stage4"] = self.alloc_scratch("stage4", length=VLEN)
-            self.add("load", ("const", self.hash_map_const_map["stage4"], 1 + (1 << 3)))
-            self.add("valu", ("vbroadcast", self.hash_map_const_map["stage4"], self.hash_map_const_map["stage4"]))
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             const_val_1 = self.hash_map_const_map[val1]
@@ -142,6 +131,64 @@ class KernelBuilder:
         return slots
 
 
+    def build_load_idx(self, i, round, tmp_idx, inp_indices, pack_stride, pack_size):
+        body = []
+        # ======== "idx = mem[inp_indices_p + i]" =======
+
+        # idx = mem[inp_indices_p + i]
+        for j in range(int(pack_size / 2)):
+            slots = [
+                ("vload", tmp_idx + j * 2 * VLEN + k * VLEN, inp_indices[i * pack_stride + j * 2 + k])
+                for k in range(2)
+            ]
+            body.append(("load", slots))
+
+        for j in range(pack_size):
+            body.append(("debug", ("vcompare", tmp_idx + j * VLEN, [(round, i * VLEN * pack_stride + j * VLEN + k, "idx") for k in range(VLEN)])))
+
+        return body
+
+    def build_load_val(self, i, round, tmp_val, inp_values, pack_stride, pack_size):
+        body = []
+        # # ======== "val = mem[inp_values_p + i]"
+
+        # # val = mem[inp_values_p + i]
+        for j in range(int(pack_size / 2)):
+            slots = [
+                ("vload", tmp_val + j * 2 * VLEN + k * VLEN, inp_values[i * pack_stride + j * 2 + k])
+                for k in range(2)
+            ]
+            body.append(("load", slots))
+
+        for j in range(pack_size):
+            body.append(("debug", ("vcompare", tmp_val + j * VLEN, [(round, i * VLEN * pack_stride + j * VLEN + k, "val") for k in range(VLEN)])))
+
+        return body
+
+    def build_load_node_val(self, i, round, tmp_node_val, tmp_addr, tmp_idx, pack_stride, pack_size):
+        body = []
+
+        # # ======== "node_val = mem[forest_values_p + idx]" ========
+
+        # # forest_values_p + idx
+        body.append(("valu", [
+            ("+", tmp_addr + j * VLEN, self.scratch["forest_values_p"], tmp_idx + j * VLEN)
+            for j in range(pack_size)
+        ]))
+
+        for k in range(pack_size):
+            for j in range(int(VLEN / 2)):
+                # Two loads can happen concurrently.
+                body.append(("load", [
+                    ("load", tmp_node_val + k * VLEN + j * 2, tmp_addr + k * VLEN + j * 2),
+                    ("load", tmp_node_val + k * VLEN + j * 2 + 1, tmp_addr + k * VLEN + j * 2 + 1),
+                ]))   
+
+        for k in range(pack_size):
+            body.append(("debug", ("vcompare", tmp_node_val + k * VLEN, [(round, i * VLEN * pack_stride + k * VLEN + j, "node_val") for j in range(VLEN)])))
+
+        return body
+
     def build_single_round(
         self,
         i,
@@ -164,56 +211,22 @@ class KernelBuilder:
 
         # ======== "idx = mem[inp_indices_p + i]" =======
 
-        # idx = mem[inp_indices_p + i]
-        for j in range(int(pack_size / 2)):
-            slots = [
-                ("vload", tmp_idx + j * 2 * VLEN + k * VLEN, inp_indices[i * pack_stride + j * 2 + k])
-                for k in range(2)
-            ]
-            body.append(("load", slots))
-
-        for j in range(pack_size):
-            body.append(("debug", ("vcompare", tmp_idx + j * VLEN, [(round, i * VLEN * pack_stride + j * VLEN + k, "idx") for k in range(VLEN)])))
+        instructions = self.build_load_idx(i, round, tmp_idx, inp_indices, pack_stride, pack_size)
+        body.extend(instructions)
 
         # # ======== "val = mem[inp_values_p + i]"
 
-        # # val = mem[inp_values_p + i]
-        for j in range(int(pack_size / 2)):
-            slots = [
-                ("vload", tmp_val + j * 2 * VLEN + k * VLEN, inp_values[i * pack_stride + j * 2 + k])
-                for k in range(2)
-            ]
-            body.append(("load", slots))
-
-        for j in range(pack_size):
-            body.append(("debug", ("vcompare", tmp_val + j * VLEN, [(round, i * VLEN * pack_stride + j * VLEN + k, "val") for k in range(VLEN)])))
+        instructions = self.build_load_val(i, round, tmp_val, inp_values, pack_stride, pack_size)
+        body.extend(instructions)
 
         # # ======== "node_val = mem[forest_values_p + idx]" ========
 
-        # # forest_values_p + idx
-        body.append(("valu", [
-            ("+", tmp_addr + j * VLEN, self.scratch["forest_values_p"], tmp_idx + j * VLEN)
-            for j in range(pack_size)
-        ]))
-
-        for k in range(pack_size):
-            for j in range(int(VLEN / 2)):
-                # Two loads can happen concurrently.
-                body.append(("load", [
-                    ("load", tmp_node_val + k * VLEN + j * 2, tmp_addr + k * VLEN + j * 2),
-                    ("load", tmp_node_val + k * VLEN + j * 2 + 1, tmp_addr + k * VLEN + j * 2 + 1),
-                ]))   
-
-        for k in range(pack_size):
-            body.append(("debug", ("vcompare", tmp_node_val + k * VLEN, [(round, i * VLEN * pack_stride + k * VLEN + j, "node_val") for j in range(VLEN)])))
+        instructions = self.build_load_node_val(i, round, tmp_node_val, tmp_addr, tmp_idx, pack_stride, pack_size)
+        body.extend(instructions)
 
         # # ======== "val = myhash(val ^ node_val)" ===========
 
-        # # val ^ node_val
         body.append(("valu", [("^", tmp_val + j * VLEN, tmp_val + j * VLEN, tmp_node_val + j * VLEN) for j in range(pack_size)]))
-        
-        # # val = myhash(val ^ node_val)
-        # TODO: Needs updating
         body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i, pack_stride, pack_size))
 
         # # ======== "idx = 2*idx + (1 if val % 2 == 0 else 2)" ========
@@ -231,7 +244,7 @@ class KernelBuilder:
         body.append(("valu", [("<", tmp1 + j * VLEN, tmp_idx + j * VLEN, self.scratch["n_nodes"]) for j in range(pack_size)]))
 
         # # "idx = 0 if idx >= n_nodes else idx"
-        for j in range(PACK_SIZE):
+        for j in range(pack_size):
             body.append(("flow", ("vselect", tmp_idx + j * VLEN, tmp1 + j * VLEN, tmp_idx + j * VLEN, zero_const)))
 
         # # ======== "mem[inp_indices_p + i] = idx" ========
@@ -251,8 +264,8 @@ class KernelBuilder:
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
         """
-        tmp1 = self.alloc_scratch("tmp1", VLEN * PACK_SIZE)
-        tmp2 = self.alloc_scratch("tmp2", VLEN * PACK_SIZE)
+        tmp1 = self.alloc_scratch("tmp1", VLEN * PACK_SIZE * 6)
+        tmp2 = self.alloc_scratch("tmp2", VLEN * PACK_SIZE * 6)
 
         # Scratch space addresses
         init_vars = [
@@ -264,9 +277,18 @@ class KernelBuilder:
             "inp_indices_p",
             "inp_values_p",
         ]
+
         for v in init_vars:
+            # Skip wasting scratch space on redundant data.
+            if v in ["rounds", "batch_size", "forest_height"]:
+                continue
             self.alloc_scratch(v, VLEN)
+
         for i, v in enumerate(init_vars):
+            # Skip wasting scratch space on redundant data.
+            if v in ["rounds", "batch_size", "forest_height"]:
+                continue
+
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
             self.add("valu", ("vbroadcast", self.scratch[v], self.scratch[v]))
@@ -286,10 +308,10 @@ class KernelBuilder:
         body = []  # array of slots
 
         # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx", VLEN * PACK_SIZE)
-        tmp_val = self.alloc_scratch("tmp_val", VLEN * PACK_SIZE)
-        tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN * PACK_SIZE)
-        tmp_addr = self.alloc_scratch("tmp_addr", VLEN * PACK_SIZE)
+        tmp_idx = self.alloc_scratch("tmp_idx", VLEN * PACK_SIZE * 6)
+        tmp_val = self.alloc_scratch("tmp_val", VLEN * PACK_SIZE * 6)
+        # tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN * PACK_SIZE * 6)
+        # tmp_addr = self.alloc_scratch("tmp_addr", VLEN * PACK_SIZE * 6)
 
         tmp_zero_const = self.alloc_scratch("zero_consts", VLEN)
         tmp_one_const = self.alloc_scratch("one_consts", VLEN)
@@ -304,65 +326,114 @@ class KernelBuilder:
         one_const = tmp_one_const
         two_const = tmp_two_const
 
-        index_consts = [self.scratch_const(i * VLEN) for i in range(int(batch_size / VLEN))]
-
         # Calculates "inp_indices_p + i" of "mem[inp_indices_p + i]" once and can be reused across rounds.
         inp_indices = [self.alloc_scratch() for i in range(int(batch_size / VLEN))]
         for i in range(int(batch_size / VLEN)):
-            self.add("alu", ("+", inp_indices[i], self.scratch["inp_indices_p"], index_consts[i]))
+            self.add("alu", ("+", inp_indices[i], self.scratch["inp_indices_p"], self.scratch_const(i * VLEN)))
 
         inp_values = [self.alloc_scratch() for i in range(int(batch_size / VLEN))]
         for i in range(int(batch_size / VLEN)):
-            self.add("alu", ("+", inp_values[i], self.scratch["inp_values_p"], index_consts[i]))
+            self.add("alu", ("+", inp_values[i], self.scratch["inp_values_p"], self.scratch_const(i * VLEN)))
 
-        for round in range(rounds):
-            full_packs = int(batch_size / VLEN / PACK_SIZE)
-            for i in range(full_packs):
-                print(i)
-                instructions = self.build_single_round(
-                    i,
-                    round,
-                    tmp_idx,
-                    tmp_val,
-                    tmp_addr,
-                    tmp_node_val,
-                    tmp1,
-                    tmp2,
-                    zero_const,
-                    one_const,
-                    two_const,
-                    inp_indices,
-                    inp_values,
-                    pack_stride=PACK_SIZE,
-                    pack_size=PACK_SIZE,
-                )
-                body.extend(instructions)
+        # Pre-compute hashing const values.
+        self.hash_map_const_map = {}
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if val1 not in self.hash_map_const_map:
+                self.hash_map_const_map[val1] = self.alloc_scratch("hash_map_const_map_val1", length=VLEN)
+                self.add("valu", ("vbroadcast", self.hash_map_const_map[val1], self.scratch_const(val1)))
 
-            # If there are batches remaining, reduce pack size to finish off the rest.
-            batches_remaining = batch_size - full_packs * VLEN * PACK_SIZE
-            if batches_remaining > 0:
-                new_pack_size = int(batches_remaining / VLEN)
-                instructions = self.build_single_round(
-                    full_packs,
-                    round,
-                    tmp_idx,
-                    tmp_val,
-                    tmp_addr,
-                    tmp_node_val,
-                    tmp1,
-                    tmp2,
-                    zero_const,
-                    one_const,
-                    two_const,
-                    inp_indices,
-                    inp_values,
-                    pack_stride=PACK_SIZE,
-                    pack_size=new_pack_size,
-                )
-                body.extend(instructions)
+            # val3 not needed for even hash stages (they use the multiply add trick instead).
+            if val3 not in self.hash_map_const_map and hi % 2 != 0:
+                self.hash_map_const_map[val3] = self.alloc_scratch("hash_map_const_map_val3", length=VLEN)
+                self.add("valu", ("vbroadcast", self.hash_map_const_map[val3], self.scratch_const(val3)))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
+        self.hash_map_const_map["stage0"] = self.alloc_scratch("stage0", length=VLEN)
+        self.add("load", ("const", self.hash_map_const_map["stage0"], 1 + (1 << 12)))
+        self.add("valu", ("vbroadcast", self.hash_map_const_map["stage0"], self.hash_map_const_map["stage0"]))
+
+        self.hash_map_const_map["stage2"] = self.alloc_scratch("stage2", length=VLEN)
+        self.add("load", ("const", self.hash_map_const_map["stage2"], 1 + (1 << 5)))
+        self.add("valu", ("vbroadcast", self.hash_map_const_map["stage2"], self.hash_map_const_map["stage2"]))
+
+        self.hash_map_const_map["stage4"] = self.alloc_scratch("stage4", length=VLEN)
+        self.add("load", ("const", self.hash_map_const_map["stage4"], 1 + (1 << 3)))
+        self.add("valu", ("vbroadcast", self.hash_map_const_map["stage4"], self.hash_map_const_map["stage4"]))
+
+        context = context = JITContext(
+            inp_indices=inp_indices,
+            inp_values=inp_values,
+            tmp_idx=tmp_idx,
+            tmp_idx_pack_stride=VLEN * PACK_SIZE,
+            tmp_val=tmp_val,
+            tmp_val_pack_stride=VLEN * PACK_SIZE,
+            tmp_addr=tmp1,
+            tmp_addr_pack_stride=VLEN * PACK_SIZE,
+            tmp_node_val=tmp2,
+            tmp_node_val_pack_stride=VLEN * PACK_SIZE,
+            forest_values_p=self.scratch["forest_values_p"],
+            val_hash_addr=tmp_val,
+            val_hash_addr_pack_stride=VLEN * PACK_SIZE,
+            hash_map_const_map=self.hash_map_const_map,
+            tmp1=tmp1,
+            tmp1_pack_stride=VLEN * PACK_SIZE,
+            tmp2=tmp2,
+            tmp2_pack_stride=VLEN * PACK_SIZE,
+            zero_const=zero_const,
+            one_const=one_const,
+            two_const=two_const,
+            n_nodes_scratch=self.scratch["n_nodes"],
+        )
+        program_code = compile_jit_code(context)
+        self.instrs.extend(program_code)
+
+        # for round in range(rounds):
+        #     full_packs = int(batch_size / VLEN / PACK_SIZE)
+        #     for i in range(full_packs):
+        #         instructions = self.build_single_round(
+        #             i,
+        #             round,
+        #             tmp_idx,
+        #             tmp_val,
+        #             tmp_addr,
+        #             tmp_node_val,
+        #             tmp1,
+        #             tmp2,
+        #             zero_const,
+        #             one_const,
+        #             two_const,
+        #             inp_indices,
+        #             inp_values,
+        #             pack_stride=PACK_SIZE,
+        #             pack_size=PACK_SIZE,
+        #         )
+        #         body.extend(instructions)
+
+        #     # If there are batches remaining, reduce pack size to finish off the rest.
+        #     batches_remaining = batch_size - full_packs * VLEN * PACK_SIZE
+        #     if batches_remaining > 0:
+        #         new_pack_size = int(batches_remaining / VLEN)
+        #         instructions = self.build_single_round(
+        #             full_packs,
+        #             round,
+        #             tmp_idx,
+        #             tmp_val,
+        #             tmp_addr,
+        #             tmp_node_val,
+        #             tmp1,
+        #             tmp2,
+        #             zero_const,
+        #             one_const,
+        #             two_const,
+        #             inp_indices,
+        #             inp_values,
+        #             pack_stride=PACK_SIZE,
+        #             pack_size=new_pack_size,
+        #         )
+        #         body.extend(instructions)
+
+        # body_instrs = self.build(body)
+        # self.instrs.extend(body_instrs)
+
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
@@ -400,8 +471,10 @@ def do_kernel_test(
         machine.run()
         inp_values_p = ref_mem[6]
         if prints:
-            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+            print(f"=============== ROUND {i}: ======================")
+            print("Actual: ", machine.mem[inp_values_p : inp_values_p + len(inp.values)])
+            print()
+            print("Reference: ", ref_mem[inp_values_p : inp_values_p + len(inp.values)])
         assert (
             machine.mem[inp_values_p : inp_values_p + len(inp.values)]
             == ref_mem[inp_values_p : inp_values_p + len(inp.values)]

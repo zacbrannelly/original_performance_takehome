@@ -270,7 +270,10 @@ class Machine:
         match slot:
             case ("load", dest, addr):
                 # print(dest, addr, core.scratch[addr])
-                self.scratch_write[dest] = self.mem[core.scratch[addr]]
+                try:
+                    self.scratch_write[dest] = self.mem[core.scratch[addr]]
+                except:
+                    breakpoint()
             case ("load_offset", dest, addr, offset):
                 # Handy for treating vector dest and addr as a full block in the mini-compiler if you want
                 self.scratch_write[dest + offset] = self.mem[
@@ -376,6 +379,8 @@ class Machine:
                         loc, keys = slot[1], slot[2]
                         ref = [self.value_trace[key] for key in keys]
                         res = core.scratch[loc : loc + VLEN]
+                        print(f"{loc}, {keys}")
+                        print(f"{res} == {ref}")
                         assert res == ref, (
                             f"{res} != {ref} for {keys} at pc={core.pc} loc={loc}"
                         )
@@ -475,11 +480,20 @@ def reference_kernel(t: Tree, inp: Input):
     """
     for h in range(inp.rounds):
         for i in range(len(inp.indices)):
+            # Get the current index and value (in the input batch)
             idx = inp.indices[i]
             val = inp.values[i]
+
+            # Hash the current batch input value with the current node value
             val = myhash(val ^ t.values[idx])
+
+            # Choose the left node if the hashed value is even, otherwise choose the right node
             idx = 2 * idx + (1 if val % 2 == 0 else 2)
+
+            # Wrap to the top if we've gone past the end of the tree
             idx = 0 if idx >= len(t.values) else idx
+
+            # Place the results of the computation back into the input batch
             inp.values[i] = val
             inp.indices[i] = idx
 
@@ -488,7 +502,7 @@ def build_mem_image(t: Tree, inp: Input) -> list[int]:
     """
     Build a flat memory image of the problem.
     """
-    header = 7
+    header = 8
     extra_room = len(t.values) + len(inp.indices) * 2 + VLEN * 2 + 32
     mem = [0] * (
         header + len(t.values) + len(inp.indices) + len(inp.values) + extra_room
@@ -509,7 +523,7 @@ def build_mem_image(t: Tree, inp: Input) -> list[int]:
 
     mem[header:inp_indices_p] = t.values
     mem[inp_indices_p:inp_values_p] = inp.indices
-    mem[inp_values_p:] = inp.values
+    mem[inp_values_p:len(inp.values)] = inp.values
     return mem
 
 
@@ -554,6 +568,7 @@ def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
             trace[(h, i, "val")] = val
             node_val = mem[forest_values_p + idx]
             trace[(h, i, "node_val")] = node_val
+            trace[(h, i, "hash_input")] = val ^ node_val
             val = myhash_traced(val ^ node_val, trace, h, i)
             trace[(h, i, "hashed_val")] = val
             idx = 2 * idx + (1 if val % 2 == 0 else 2)
