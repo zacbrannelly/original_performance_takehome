@@ -6,9 +6,6 @@ PACK_SIZE = 6
 ROUNDS = 16
 
 def get_new_state(pack_size):
-  # TODO: This fixes bugs with the pack_size=2 case, look into why!!!!!!
-  # pack_size = 6
-
   return {
     "LOAD_IDX": {
       "offset": 0,
@@ -20,7 +17,8 @@ def get_new_state(pack_size):
     },
     "COMPUTE_NODE_VAL_IDX": {
       "offset": 0,
-      "valu": pack_size,
+      # "valu": pack_size,
+      "alu": 8 * pack_size,
     },
     "LOAD_NODE_VAL": {
       "offset": 0,
@@ -29,24 +27,25 @@ def get_new_state(pack_size):
     "COMPUTE_HASH_INPUT": {
       "offset": 0,
       "valu": pack_size,
+      # "alu": 8 * pack_size,
     },
     "COMPUTE_HASH": {
       "offset": 0,
-      # "valu": 12 * pack_size,
       "valu": 12 * 6,
     },
     "COMPUTE_NEXT_NODE": {
       "offset": 0,
-      # "valu": pack_size * 3,
       "valu": 6 * 3,
     },
     "COMPUTE_OVERFLOW_CONDITION": {
       "offset": 0,
       "valu": pack_size,
+      # "alu": 8 * pack_size,
     },
     "WRAP_ON_OVERFLOW": {
       "offset": 0,
-      "flow": 1 * pack_size,
+      # "flow": pack_size,
+      "valu": pack_size,
     },
     "STORE_IDX": {
       "offset": 0,
@@ -121,6 +120,7 @@ def main():
     all_complete = True
 
     tick_slots = {
+      "alu": 12,
       "valu": 6,
       "flow": 1,
       "load": 2,
@@ -154,26 +154,26 @@ def main():
 
           round_idx = thread.current_op_idx // len(SINGLE_ROUND_OPERATIONS)
 
-          tick_ops.append((thread_id, current_op, offset, thread.pack_size, round_idx))
+          tick_ops.append((thread_id, current_op, offset, thread.pack_size, round_idx, consumed_slots))
           slots["offset"] += 1
 
           # OP is complete, go to the next op.
           if new_remaining_slots == 0:
             # Add debug ops.
             if current_op == "LOAD_IDX":
-              additional_ops.append((thread_id, "DEBUG_LOAD_IDX", 0, thread.pack_size, round_idx))
+              additional_ops.append((thread_id, "DEBUG_LOAD_IDX", 0, thread.pack_size, round_idx, 0))
             elif current_op == "LOAD_VAL":
-              additional_ops.append((thread_id, "DEBUG_LOAD_VAL", 0, thread.pack_size, round_idx))
+              additional_ops.append((thread_id, "DEBUG_LOAD_VAL", 0, thread.pack_size, round_idx, 0))
             elif current_op == "LOAD_NODE_VAL":
-              additional_ops.append((thread_id, "DEBUG_LOAD_NODE_VAL", 0, thread.pack_size, round_idx))
+              additional_ops.append((thread_id, "DEBUG_LOAD_NODE_VAL", 0, thread.pack_size, round_idx, 0))
             elif current_op == "COMPUTE_HASH_INPUT":
-              additional_ops.append((thread_id, "DEBUG_COMPUTE_HASH_INPUT", 0, thread.pack_size, round_idx))
+              additional_ops.append((thread_id, "DEBUG_COMPUTE_HASH_INPUT", 0, thread.pack_size, round_idx, 0))
             elif current_op == "COMPUTE_HASH":
-              additional_ops.append((thread_id, "DEBUG_COMPUTE_HASH", 0, thread.pack_size, round_idx))
+              additional_ops.append((thread_id, "DEBUG_COMPUTE_HASH", 0, thread.pack_size, round_idx, 0))
             elif current_op == "COMPUTE_NEXT_NODE":
-              additional_ops.append((thread_id, "DEBUG_COMPUTE_NEXT_NODE", 0, thread.pack_size, round_idx))
+              additional_ops.append((thread_id, "DEBUG_COMPUTE_NEXT_NODE", 0, thread.pack_size, round_idx, 0))
             elif current_op == "WRAP_ON_OVERFLOW":
-              additional_ops.append((thread_id, "DEBUG_WRAP_ON_OVERFLOW", 0, thread.pack_size, round_idx))
+              additional_ops.append((thread_id, "DEBUG_WRAP_ON_OVERFLOW", 0, thread.pack_size, round_idx, 0))
 
             # Go to next op in thread.
             thread.next()

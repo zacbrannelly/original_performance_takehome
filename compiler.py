@@ -43,7 +43,7 @@ class JITContext:
 
   n_nodes_scratch: int
 
-def compile_load_idx(pack_idx, offset, pack_size, round_idx, context):
+def compile_load_idx(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_idx = context.tmp_idx + pack_idx * context.tmp_idx_pack_stride
   slots = [
     (
@@ -57,7 +57,7 @@ def compile_load_idx(pack_idx, offset, pack_size, round_idx, context):
     "load": slots,
   }
 
-def compile_debug_load_idx(pack_idx, offset, pack_size, round_idx, context):
+def compile_debug_load_idx(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_idx = context.tmp_idx + pack_idx * context.tmp_idx_pack_stride
   return {
     "debug": [
@@ -70,7 +70,7 @@ def compile_debug_load_idx(pack_idx, offset, pack_size, round_idx, context):
     ],
   }
 
-def compile_load_val(pack_idx, offset, pack_size, round_idx, context):
+def compile_load_val(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_val = context.tmp_val + pack_idx * context.tmp_val_pack_stride
   slots = [
     (
@@ -84,7 +84,7 @@ def compile_load_val(pack_idx, offset, pack_size, round_idx, context):
     "load": slots,
   }
 
-def compile_debug_load_val(pack_idx, offset, pack_size, round_idx, context):
+def compile_debug_load_val(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_val = context.tmp_val + pack_idx * context.tmp_val_pack_stride
   return {
     "debug": [
@@ -97,23 +97,33 @@ def compile_debug_load_val(pack_idx, offset, pack_size, round_idx, context):
     ],
   }
 
-def compile_compute_node_val_idx(pack_idx, offset, pack_size, round_idx, context):
+def compile_compute_node_val_idx(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_addr = context.tmp_addr + pack_idx * context.tmp_addr_pack_stride
   tmp_idx = context.tmp_idx + pack_idx * context.tmp_idx_pack_stride
-  slots = [
-    (
-      "+",
-      tmp_addr + j * VLEN,
-      context.forest_values_p,
-      tmp_idx + j * VLEN
-    )
-    for j in range(pack_size)
-  ]
+
+  # SIMD version:
+  # slots = [
+  #   (
+  #     "+",
+  #     tmp_addr + j * VLEN,
+  #     context.forest_values_p,
+  #     tmp_idx + j * VLEN
+  #   )
+  #   for j in range(pack_size)
+  # ]
+  # return {
+  #   "valu": slots,
+  # }
+
+  # ALU version:
   return {
-    "valu": slots,
+    "alu": [
+      ("+", tmp_addr + offset * 12 + j, context.forest_values_p, tmp_idx + offset * 12 + j)
+      for j in range(consumed_slots)
+    ]
   }
 
-def compile_load_node_val(pack_idx, offset, pack_size, round_idx, context):
+def compile_load_node_val(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_node_val = context.tmp_node_val + pack_idx * context.tmp_node_val_pack_stride
   tmp_addr = context.tmp_addr + pack_idx * context.tmp_addr_pack_stride
 
@@ -127,7 +137,7 @@ def compile_load_node_val(pack_idx, offset, pack_size, round_idx, context):
     ]
   }
 
-def compile_debug_load_node_val(pack_idx, offset, pack_size, round_idx, context):
+def compile_debug_load_node_val(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_node_val = context.tmp_node_val + pack_idx * context.tmp_node_val_pack_stride
 
   return {
@@ -137,7 +147,7 @@ def compile_debug_load_node_val(pack_idx, offset, pack_size, round_idx, context)
     ]
   }
 
-def compile_compute_hash_input(pack_idx, offset, pack_size, round_idx, context):
+def compile_compute_hash_input(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_val = context.tmp_val + pack_idx * context.tmp_val_pack_stride
   tmp_node_val = context.tmp_node_val + pack_idx * context.tmp_node_val_pack_stride
 
@@ -148,7 +158,7 @@ def compile_compute_hash_input(pack_idx, offset, pack_size, round_idx, context):
     ]
   }
 
-def compile_debug_compute_hash_input(pack_idx, offset, pack_size, round_idx, context):
+def compile_debug_compute_hash_input(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_val = context.tmp_val + pack_idx * context.tmp_val_pack_stride
   
   return {
@@ -158,7 +168,7 @@ def compile_debug_compute_hash_input(pack_idx, offset, pack_size, round_idx, con
     ]
   }
 
-def compile_compute_hash(pack_idx, offset, pack_size, round_idx, context):
+def compile_compute_hash(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   slots = []
 
   val_hash_addr = context.val_hash_addr + pack_idx * context.val_hash_addr_pack_stride
@@ -214,7 +224,7 @@ def compile_compute_hash(pack_idx, offset, pack_size, round_idx, context):
     "valu": slots,
   }
 
-def compile_debug_compute_hash(pack_idx, offset, pack_size, round_idx, context):
+def compile_debug_compute_hash(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   val_hash_addr = context.val_hash_addr + pack_idx * context.val_hash_addr_pack_stride
 
   return {
@@ -224,7 +234,7 @@ def compile_debug_compute_hash(pack_idx, offset, pack_size, round_idx, context):
     ]
   }
 
-def compile_compute_next_node(pack_idx, offset, pack_size, round_idx, context):
+def compile_compute_next_node(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   slots = []
 
   tmp1 = context.tmp1 + pack_idx * context.tmp1_pack_stride
@@ -251,7 +261,7 @@ def compile_compute_next_node(pack_idx, offset, pack_size, round_idx, context):
     "valu": slots,
   }
 
-def compile_debug_compute_next_node(pack_idx, offset, pack_size, round_idx, context):
+def compile_debug_compute_next_node(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_idx = context.tmp_idx + pack_idx * context.tmp_idx_pack_stride
 
   return {
@@ -261,7 +271,7 @@ def compile_debug_compute_next_node(pack_idx, offset, pack_size, round_idx, cont
     ]
   }
 
-def compile_compute_overflow_condition(pack_idx, offset, pack_size, round_idx, context):
+def compile_compute_overflow_condition(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp1 = context.tmp1 + pack_idx * context.tmp1_pack_stride
   tmp_idx = context.tmp_idx + pack_idx * context.tmp_idx_pack_stride
   return {
@@ -271,17 +281,25 @@ def compile_compute_overflow_condition(pack_idx, offset, pack_size, round_idx, c
     ]
   }
   
-def compile_wrap_on_overflow(pack_idx, offset, pack_size, round_idx, context):
+def compile_wrap_on_overflow(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_idx = context.tmp_idx + pack_idx * context.tmp_idx_pack_stride
   tmp1 = context.tmp1 + pack_idx * context.tmp1_pack_stride
 
+  # FLOW version:
+  # return {
+  #   "flow": [
+  #      ("vselect", tmp_idx + offset * VLEN, tmp1 + offset * VLEN, tmp_idx + offset * VLEN, context.zero_const)
+  #   ]
+  # }
+
   return {
-    "flow": [
-      ("vselect", tmp_idx + offset * VLEN, tmp1 + offset * VLEN, tmp_idx + offset * VLEN, context.zero_const)
+    "valu": [
+      ("multiply_add", tmp_idx + j * VLEN, tmp1 + j * VLEN, tmp_idx + j * VLEN, context.zero_const)
+      for j in range(pack_size)
     ]
   }
 
-def compile_debug_wrap_on_overflow(pack_idx, offset, pack_size, round_idx, context):
+def compile_debug_wrap_on_overflow(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_idx = context.tmp_idx + pack_idx * context.tmp_idx_pack_stride
   return {
     "debug": [
@@ -290,7 +308,7 @@ def compile_debug_wrap_on_overflow(pack_idx, offset, pack_size, round_idx, conte
     ]
   }
 
-def compile_store_idx(pack_idx, offset, pack_size, round_idx, context):
+def compile_store_idx(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_idx = context.tmp_idx + pack_idx * context.tmp_idx_pack_stride
   return {
     "store": [
@@ -299,7 +317,7 @@ def compile_store_idx(pack_idx, offset, pack_size, round_idx, context):
     ]
   }
 
-def compile_store_val(pack_idx, offset, pack_size, round_idx, context):
+def compile_store_val(pack_idx, offset, pack_size, round_idx, consumed_slots, context):
   tmp_val = context.tmp_val + pack_idx * context.tmp_val_pack_stride
   return {
     "store": [
@@ -337,10 +355,10 @@ def compile_jit_code(context: JITContext):
   
   for slots in program_ir:
     instruction = {}
-    for pack_idx, operation, offset, pack_size, round_idx in slots:
+    for pack_idx, operation, offset, pack_size, round_idx, consumed_slots in slots:
       if operation not in COMPILE_MAP:
         continue
-      compiled_slots = COMPILE_MAP[operation](pack_idx, offset, pack_size, round_idx, context)
+      compiled_slots = COMPILE_MAP[operation](pack_idx, offset, pack_size, round_idx, consumed_slots, context)
       instruction = {**instruction, **compiled_slots}
 
     output_code.append(instruction)
